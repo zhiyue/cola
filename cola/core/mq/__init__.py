@@ -20,160 +20,153 @@ Created on 2013-5-23
 @author: Chine
 '''
 
-import os
+import multiprocessing
+import threading
 
-from cola.core.utils import get_ip
-from cola.core.mq.hash_ring import HashRing
-from cola.core.mq.node import Node
-from cola.core.rpc import client_call
+from cola.core.mq.node import MessageQueueNodeProxy
+from cola.core.mq.client import MessageQueueClient
 
-class MessageQueue(object):
-    def __init__(self, nodes, local_node=None, rpc_server=None, 
-                 local_store=None, backup_stores=None, copies=1):
-        self.nodes = nodes
-        self.local_node = local_node
-        self.local_store = local_store
-        self.rpc_server = rpc_server
-        self.backup_stores = backup_stores
-        self.hash_ring = HashRing(self.nodes)
-        self.copies = max(min(len(self.nodes)-1, copies), 0)
+PUT, PUT_INC, GET, GET_INC, EXIST = range(5) # 5 operations now Cola MQ supports
+
+MessageQueueClient = MessageQueueClient
+
+
+class MessageQueue(MessageQueueNodeProxy):
+    """
+    The actual API for Cola message queue.
+
+    The message queue uses :class:`~cola.core.mq.hash_ring.HashRing`
+    to provide the ability for data distribution, hence when a
+    message queue is initialized, a single message queue node should
+    be aware of the the entire cluster.
+
+    Basically, the Cola message queue may contain multiple priorities
+    as well as several backup copies according to the user's setting.
+    Besides, the incremental queue is also available.
+
+    Actually, this class is a wrapper for
+    :class:`~cola.core.mq.node.MessageQueueNodeProxy`
+    to provide the ability for cross-process call.
+    Five operations are supported include ``PUT``, ``PUT_INC``,
+    ``GET``, ``GET_INC`` and ``EXIST``.
+    """
+
+    def __init__(self, working_dir, rpc_server, addr, addrs, 
+                 app_name=None, copies=1, n_priorities=3,
+                 deduper=None):
+        """
+        Initialization method for the Cola message queue.
+
+        :param working_dir: data for the mq should be serialized into this dir
+        :param rpc_server: can be null when running under local mode
+        :param addr: this worker address, as the ``ip:port``
+        :param addrs: the whole worker addresses of the cluster
+        :param app_name: ``optional`` if the mq used for some app
+        :param copies: default as 1, an object will be delivered to the node
+               on the hash ring if copy is 1
+        :param n_priorities: the mq will include multiple priorities
+        :param deduper: ``optional`` :class:`~cola.core.dedup.Deduper` instance
+               for removing the duplication
+        """
+        super(MessageQueue, self).__init__(working_dir, rpc_server, addr, addrs,
+                                           copies=copies, n_priorities=n_priorities,
+                                           deduper=deduper, app_name=app_name)
         
-        if rpc_server is not None and \
-            self.local_store is not None and \
-            self.backup_stores is not None:
-            self._register_rpc()
-            
-    def _register_rpc(self):
-        self.rpc_server.register_function(self.put_backup, 'put_backup')
-        self.rpc_server.register_instance(self.local_store)
-            
-    def init_store(self, local_store_path, backup_stores_path, 
-                   verify_exists_hook=None):
-        self.local_store = Node(local_store_path, 
-                                verify_exists_hook=verify_exists_hook)
-        self.backup_stores_path = backup_stores_path
+        self.stopped = multiprocessing.Event()
+        self.agents = []
+        self.threads = []
+        self.clients = {}
         
-        backup_nodes = self.nodes[:]
-        backup_nodes.remove(self.local_node)
-        self.backup_stores = {}
-        for backup_node in backup_nodes:
-            backup_node_dir = backup_node.replace(':', '_')
-            backup_path = os.path.join(backup_stores_path, backup_node_dir)
-            if not os.path.exists(backup_path):
-                os.makedirs(backup_path)
-            self.backup_stores[backup_node] = Node(backup_path, 
-                                                   size=512*1024)
-            
-        self._register_rpc()
+    def new_connection(self, k):
+        if k in self.clients: return self.clients[k]
         
-    def _put(self, node, objs, force=False):
-        if node == self.local_node:
-            self.local_store.put(objs, force=force)
-        else:
-            client_call(node, 'put', objs, force)
-                
-    def _put_backup(self, node, src, objs, force=False):
-        if node == self.local_node:
-            self.put_backup(src, objs, force=force)
-        else:
-            client_call(node, 'put_backup', src, objs, force)
-                
-    def _get(self, node):
-        if node == self.local_node:
-            return self.local_store.get()
-        else:
-            return client_call(node, 'get')
+        agent, client = multiprocessing.Pipe()
+        self.agents.append(agent)
+        _t = threading.Thread(target=self._init_process, args=(agent,))
+        self.threads.append(_t)
+        _t.start()
         
-    def put(self, obj_or_objs, force=False):
-        def _check(obj):
-            if not isinstance(obj, basestring):
-                raise ValueError("MessageQueue can only put basestring objects.")
-        if isinstance(obj_or_objs, (tuple, list)):
-            for obj in obj_or_objs:
-                _check(obj)
-            objs = obj_or_objs
-        else:
-            _check(obj_or_objs)
-            objs = [obj_or_objs]
-        
-        puts = {}
-        bkup_puts = {}
-        for obj in objs:
-            if isinstance(obj, unicode):
-                obj = obj.encode('utf-8')
+        self.clients[k] = client
+        return client
+    
+    def _init_process(self, agent):
+        while not self.stopped.is_set():
+            need_process = agent.poll(10)
+            if self.stopped.is_set():
+                return
+            if not need_process:
+                continue
             
-            it = self.hash_ring.iterate_nodes(obj)
+            action, data = agent.recv()
+            if action == PUT:
+                objs, flush = data
+                self.put(objs, flush=flush)
+                agent.send(1)
+            elif action == PUT_INC:
+                self.put_inc(data)
+                agent.send(1)
+            elif action == GET:
+                size, priority = data
+                agent.send(self.get(size=size, 
+                                    priority=priority))
+            elif action == GET_INC:
+                agent.send(self.get_inc(data))
+            elif action == EXIST:
+                if not self.mq_node.deduper:
+                    agent.send(False)
+                else:
+                    agent.send(self.exist(str(data)))
+            else:
+                raise ValueError('mq client can only put, put_inc, and get')
             
-            # put obj into an mq node.
-            put_node = next(it)
-            obs = puts.get(put_node, [])
-            obs.append(obj)
-            puts[put_node] = obs
-            
-            for _ in xrange(self.copies):
-                bkup_node = next(it)
-                if bkup_node is None: continue
-                
-                kv = bkup_puts.get(bkup_node, {})
-                obs = kv.get(put_node, [])
-                obs.append(obj)
-                kv[put_node] = obs
-                bkup_puts[bkup_node] = kv
-        
-        for k, v in puts.iteritems():
-            self._put(k, v, force=force)
-        for k, v in bkup_puts.iteritems():
-            for src_node, obs in v.iteritems():
-                self._put_backup(k, src_node, obs, force=force)
-            
-    def put_backup(self, src, obj_or_objs, force=False):
-        backup_store = self.backup_stores[src]
-        backup_store.put(obj_or_objs, force=force)
-            
-    def get(self):
-        if self.local_node is not None:
-            nodes = sorted(self.nodes, key=lambda k: k==self.local_node, reverse=True)
-        else:
-            nodes = self.nodes
-        for n in nodes:
-            obj = self._get(n)
-            if obj is not None:
-                return obj
-            
-    def remove_node(self, node):
-        self.nodes.remove(node)
-        self.hash_ring = HashRing(self.nodes)
-        
-        backup_store = self.backup_stores[node]
-        obj = backup_store.get()
-        while obj is not None:
-            self.local_store.put(obj)
-            obj = backup_store.get()
-            
-        backup_store.shutdown()
-        del self.backup_stores[node]
-        
-    def add_node(self, node, backup_store=None):
-        self.nodes.append(node)
-        self.hash_ring = HashRing(self.nodes)
-        if backup_store is not None:
-            self.backup_stores[node] = backup_store
-        else:
-            backup_stores_path = getattr(self, 'backup_stores_path')
-            if backup_stores_path is not None:
-                path = os.path.join(backup_stores_path, node.replace(':', '_'))
-                if not os.path.exists(path):
-                    os.makedirs(path)
-                self.backup_stores[node] = Node(path, 
-                                                size=512*1024)
+    def _join(self):
+        [t.join() for t in self.threads]
             
     def shutdown(self):
-        self.local_store.shutdown()
-        for backup_store in self.backup_stores.values():
-            backup_store.shutdown()
-            
-    def __enter__(self):
-        return self
-    
-    def __exit__(self):
-        self.shutdown()
+        super(MessageQueue, self).shutdown()
+        self.stopped.set()
+        self._join()
+        [agent.close() for agent in self.agents]
+
+
+def lock(f):
+    def _inner(self, *args, **kwargs):
+        with self.lock:
+            return f(self, *args, **kwargs)
+
+    return _inner
+
+
+class MpMessageQueueClient(object):
+    """
+    Client of message queue for the multi-processing call
+    """
+
+    def __init__(self, conn):
+        self.conn = conn
+        self.lock = multiprocessing.Lock()
+
+    @lock
+    def put(self, objs, flush=False):
+        self.conn.send((PUT, (objs, flush)))
+        self.conn.recv()
+
+    @lock
+    def put_inc(self, objs):
+        self.conn.send((PUT_INC, objs))
+        self.conn.recv()
+
+    @lock
+    def get(self, size=1, priority=0):
+        self.conn.send((GET, (size, priority)))
+        return self.conn.recv()
+
+    @lock
+    def get_inc(self, size=1):
+        self.conn.send((GET_INC, size))
+        return self.conn.recv()
+
+    @lock
+    def exist(self, obj):
+        self.conn.send((EXIST, str(obj)))
+        return self.conn.recv()

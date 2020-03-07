@@ -5,3 +5,8 @@
 /data/*
 /data
 *test.yaml
+*.DS_Store
+/build
+/dist
+/Cola.egg-info
+/.idea

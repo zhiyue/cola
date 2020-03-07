@@ -25,6 +25,7 @@ from SimpleXMLRPCServer import SimpleXMLRPCServer
 import xmlrpclib
 import os
 import socket
+import threading
 
 RETRY_TIMES = 10
 
@@ -33,7 +34,32 @@ class ColaRPCServer(SocketServer.ThreadingMixIn, SimpleXMLRPCServer):
     def __init__(self, *args, **kwargs):
         SimpleXMLRPCServer.__init__(self, *args, **kwargs)
         self.allow_none = True
+        self.allow_reuse_address = True
+        
+    def register_function(self, function, name=None, prefix=None):
+        if prefix is not None:
+            if name is None:
+                name = function.__name__
+            prefix = prefix+'_' if not prefix.endswith('_') else prefix
+            SimpleXMLRPCServer.register_function(self, function, name=prefix+name)
+        else:
+            SimpleXMLRPCServer.register_function(self, function, name=name)
+        
+class ThreadedColaRPCServer(object):
     
+    def __init__(self, *args, **kwargs):
+        self.rpc_server = ColaRPCServer(*args, **kwargs)
+        self._t = threading.Thread(target=self.rpc_server.serve_forever)
+        self._t.setDaemon(True)
+        self._t.start()
+        
+    def register_function(self, function, name=None, prefix=None):
+        self.rpc_server.register_function(function, name=name,
+                                          prefix=prefix)
+        
+    def shutdown(self):
+        self.rpc_server.shutdown()
+        self._t.join()
         
 def client_call(server, func_name, *args, **kwargs):
     serv = xmlrpclib.ServerProxy('http://%s' % server)

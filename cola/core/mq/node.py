@@ -15,241 +15,525 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Created on 2013-5-23
+Created on 2014-4-27
 
-@author: Chine
+@author: chine
 '''
 
 import os
 import threading
-import mmap
-import platform
+try:
+    import cPickle as pickle
+except ImportError:
+    import pickle
+from collections import defaultdict
+import socket
 
-class NodeExistsError(Exception): pass
+from cola.core.rpc import client_call
+from cola.core.utils import get_rpc_prefix
+from cola.core.mq.store import Store
+from cola.core.mq.distributor import Distributor
+    
+MQ_STATUS_FILENAME = 'mq.status' # file name of message queue status
 
-class NodeNotSafetyShutdown(Exception): pass
+PRIORITY_STORE_FN = 'store'
+BACKUP_STORE_FN = 'backup'
+INCR_STORE_FN = 'inc'
 
-class NodeNoSpaceForPut(Exception): pass
+CACHE_SIZE = 20
 
-NODE_FILE_SIZE = 4 * 1024 * 1024 # single node store file must be less than 4M.
 
-class Node(object):
-    def __init__(self, dir_, size=NODE_FILE_SIZE, verify_exists_hook=None):
-        self.lock = threading.Lock()
-        self.NODE_FILE_SIZE = size
-        self.verify_exists_hook = verify_exists_hook
+class LocalMessageQueueNode(object):
+    """
+    Message queue node which only handle local mq operations
+    can also be in charge of handling the remote call.
+    This node includes several storage such as priority storage
+    for each priority, incremental storage as well as the
+    backup storage. Each storage is an instance of
+    :class:`~cola.core.mq.store.Store`.
+    """
+    def __init__(self, base_dir, rpc_server, addr, addrs,
+                 copies=1, n_priorities=3, deduper=None,
+                 app_name=None):
+        self.dir_ = base_dir
+        self.rpc_server = rpc_server
         
-        self.dir_ = dir_
-        self.lock_file = os.path.join(dir_, 'lock')
-        with self.lock:
-            if os.path.exists(self.lock_file):
-                raise NodeExistsError('Directory is being used by another node.')
-            else:
-                open(self.lock_file, 'w').close()
+        assert addr in addrs
+        self.addr = addr
+        self.addrs = addrs
+        self.other_addrs = [n for n in self.addrs if n != self.addr]
+        
+        self.copies = max(min(len(self.addrs)-1, copies), 0)
+        self.n_priorities = max(n_priorities, 1)
+        self.deduper = deduper
+        self.app_name = app_name
+        
+        self._lock = threading.Lock()
+        
+        self._register_rpc()
+        
+        self.inited = False
+        
+    def init(self):
+        with self._lock:
+            if self.inited: return
             
-        self.old_files = []
-        self.map_files = []
-        self.file_handles = {}
-        self.map_handles = {}
-        self.stopped = False
-        self.check()
-        self.map()
+            get_priority_store_dir = lambda priority: os.path.join(self.dir_, 
+                                        PRIORITY_STORE_FN, str(priority))
+            self.priority_stores = [Store(get_priority_store_dir(i), 
+                                          deduper=self.deduper,
+                                          mkdirs=True) \
+                                    for i in range(self.n_priorities)]
             
+    
+            backup_store_dir = os.path.join(self.dir_, BACKUP_STORE_FN)
+            self.backup_stores = {}
+            for backup_addr in self.other_addrs:
+                backup_node_dir = backup_addr.replace(':', '_')
+                backup_path = os.path.join(backup_store_dir, backup_node_dir)
+                self.backup_stores[backup_addr] = Store(backup_path, 
+                                                       size=512*1024, mkdirs=True)
+                
+            inc_store_dir = os.path.join(self.dir_, INCR_STORE_FN)
+            self.inc_store = Store(inc_store_dir, mkdirs=True)
+                    
+            self.inited = True
+        
+    def _register_rpc(self):
+        if self.rpc_server:
+            self.register_rpc(self, self.rpc_server, app_name=self.app_name)
+                
+    @classmethod
+    def register_rpc(cls, node, rpc_server, app_name=None):
+        prefix = get_rpc_prefix(app_name, 'mq')
+        rpc_server.register_function(node.put_proxy, name='put', 
+                                     prefix=prefix)
+        rpc_server.register_function(node.batch_put_proxy, name='batch_put', 
+                                     prefix=prefix)
+        rpc_server.register_function(node.put_backup_proxy, name='put_backup',
+                                     prefix=prefix)
+        rpc_server.register_function(node.get_proxy, name='get',
+                                     prefix=prefix)
+        rpc_server.register_function(node.exist, name='exist',
+                                     prefix=prefix)
+
+    def put(self, objs, force=False, priority=0):
+        self.init()
+
+        priority = max(min(priority, self.n_priorities-1), 0)
+        priority_store = self.priority_stores[priority]
+        priority_store.put(objs, force=force)
+        
+    def put_proxy(self, pickled_objs, force=False, priority=0):
+        """
+        The objects from remote call should be pickled to
+        avoid the serialization error.
+
+        :param pickled_objs: the pickled objects to put into mq
+        :param force: if set to True will be directly put into mq without
+               checking the duplication
+        :param priority: the priority queue to put into
+        """
+        objs = pickle.loads(pickled_objs)
+        self.put(objs, force=force, priority=priority)
+        
+    def batch_put(self, objs):
+        self.init()
+        
+        puts = defaultdict(lambda:defaultdict(list))
+        for obj in objs:
+            priority = getattr(obj, 'priority', 0)
+            force = getattr(obj, 'force', False)
+            puts[priority][force].append(obj)
+        
+        for priority, m in puts.iteritems():
+            for force, obs in m.iteritems():
+                self.put(obs, force=force, priority=priority)
+                
+    def batch_put_proxy(self, pickled_objs):
+        """
+        Unlike the :func:`put`, this method will check the ``priority``
+        of a single object to decide which priority queue to put into.
+        """
+        objs = pickle.loads(pickled_objs)
+        self.batch_put(objs)
+    
+    def put_backup(self, addr, objs, force=False):
+        self.init()
+        
+        backup_store = self.backup_stores[addr]
+        backup_store.put(objs, force=force)
+        
+    def put_backup_proxy(self, addr, pickled_objs, force=False):
+        """
+        In the Cola backup mechanism, an object will not only be
+        put into a hash ring node, and also be put into the next
+        hash ring node which marked as a backup node. To the backup node,
+        it will remember the previous node's name.
+
+        :param addr: the node address to backup
+        :param pickled_objs: pickled objects
+        :param force: if True will be put into queue without checking duplication
+        """
+        objs = pickle.loads(pickled_objs)
+        self.put_backup(addr, objs, force=force)
+        
+    def put_inc(self, objs, force=True):
+        self.init()
+        
+        self.inc_store.put(objs, force=force)
+        
+    def get(self, size=1, priority=0):
+        self.init()
+        
+        priority = max(min(priority, self.n_priorities-1), 0)
+        priority_store = self.priority_stores[priority]
+        return priority_store.get(size=size)
+    
+    def get_proxy(self, size=1, priority=0):
+        """
+        Get the objects from the specific priority queue.
+
+        :param size: if size == 1 will be the right object,
+               else will be the objects list
+        :param priority:
+        :return: unpickled objects
+        """
+        return pickle.dumps(self.get(size=size, priority=priority))
+    
+    def get_backup(self, addr, size=1):
+        self.init()
+        
+        backup_store = self.backup_stores[addr]
+        return backup_store.get(size=size)
+    
+    def get_inc(self, size=1):
+        self.init()
+        
+        return self.inc_store.get(size=size)
+    
+    def add_node(self, addr):
+        """
+        When a new message queue node is in, firstly will add the address
+        to the known queue nodes, then a backup for this node will be created.
+        """
+        if addr in self.addrs: return
+        
+        self.addrs.append(addr)
+        
+        backup_store_dir = os.path.join(self.dir_, BACKUP_STORE_FN)
+        backup_node_dir = addr.replace(':', '_')
+        backup_path = os.path.join(backup_store_dir, backup_node_dir)
+        self.backup_stores[addr] = Store(backup_path, 
+                                         size=512*1024, mkdirs=True)
+        
+    def remove_node(self, addr):
+        """
+        For the removed node, this method is for the cleaning job including
+        shutting down the backup storage for the removed node.
+        """
+        if addr not in self.addrs: return
+        
+        self.addrs.remove(addr)
+        self.backup_stores[addr].shutdown()
+        del self.backup_stores[addr]
+        
+    def exist(self, obj):
+        if self.deduper:
+            return self.deduper.exist(str(obj))
+        return False
+    
     def shutdown(self):
-        if self.stopped: return
-        self.stopped = True
+        if not self.inited: return
         
-        try:
-            self.merge()
-            
-            for handle in self.map_handles.values():
-                handle.close()
-            for handle in self.file_handles.values():
-                handle.close()
-                
-            # Move a store to an old one.
-            for f in self.old_files:
-                os.remove(f)
-            for f in self.map_files:
-                os.rename(f, f + '.old')
-                
-            if self.verify_exists_hook is not None:
-                self.verify_exists_hook.sync()
-                self.verify_exists_hook.close()
-        finally:
-            with self.lock:
-                os.remove(self.lock_file)
+        [store.shutdown() for store in self.priority_stores]
+        for backup_store in self.backup_stores.values():
+            backup_store.shutdown()
+        self.inc_store.shutdown()
+
+
+class MessageQueueNodeProxy(object):
+    """
+    This class maintains an instance of :class:`~cola.core.mq.node.LocalMessageQueueNode`,
+    and provide `PUT` and `GET` relative method.
+    In each mq operation, it will execute a local or remote call by judging the address.
+    The Remote call will actually send a RPC to the destination worker's instance which
+    execute the method provided by :class:`~cola.core.mq.node.LocalMessageQueueNode`.
+
+    Besides, this class also maintains an instance of :class:`~cola.core.mq.distributor.Distributor`
+    which holds a hash ring. To an object of `PUT` operation, the object should be distributed to
+    the destination according to the mechanism of the hash ring. Remember, a cache will be created
+    to avoid the frequent write operations which may cause high burden of a message queue node.
+    To `GET` operation, the mq will just fetch an object from the local node,
+    or request from other nodes if local one's objects are exhausted.
+    """
+    def __init__(self, base_dir, rpc_server, addr, addrs,
+                 copies=1, n_priorities=3, deduper=None,
+                 app_name=None, logger=None):
+        self.dir_ = base_dir
+        self.addr_ = addr
+        self.addrs = list(addrs)
+        self.mq_node = LocalMessageQueueNode(
+            base_dir, rpc_server, addr, addrs, 
+            copies=copies, n_priorities=n_priorities, deduper=deduper,
+            app_name=app_name)
+        self.distributor = Distributor(addrs, copies=copies)
+        self.logger = logger
         
-    def check(self):
-        files = os.listdir(self.dir_)
-        for fi in files:
-            if fi == 'lock': continue
-            
-            file_path = os.path.join(self.dir_, fi)
-            if not os.path.isfile(file_path) or \
-                not fi.endswith('.old'):
-                raise NodeNotSafetyShutdown('Node did not shutdown safety last time.')
-            else:
-                self.old_files.append(file_path)
-                
-        self.old_files = sorted(self.old_files, key=lambda k: int(os.path.split(k)[1].rsplit('.', 1)[0]))
-        self.map_files = [f.rsplit('.', 1)[0] for f in self.old_files]
+        self.prefix = get_rpc_prefix(app_name, 'mq')
         
-    def map(self):
-        for (old, new) in zip(self.old_files, self.map_files):
-            with open(old) as old_fp:
-                fp = open(new, 'w+')
-                self.file_handles[new] = fp
-                content = old_fp.read()
-                fp.write(content)
-                fp.flush()
-                
-                if len(content) > 0:
-                    m = mmap.mmap(fp.fileno(), self.NODE_FILE_SIZE)
-                    self.map_handles[new] = m
-                    
-        if len(self.map_files) == 0:
-            path = os.path.join(self.dir_, '1')
-            self.map_files.append(path)
-            self.file_handles[path] = open(path, 'w+')
+        self._lock = threading.Lock()
+        self.inited = False
+        
+    @classmethod
+    def register_rpc(cls, node, rpc_server, app_name=None):
+        LocalMessageQueueNode.register_rpc(node.mq_node, rpc_server, 
+                                           app_name=app_name)
+        
+    def init(self):
+        with self._lock:
+            if self.inited: return
             
-    def _write_obj(self, fp, obj):
-        if platform.system() == "Windows":
-            fp.write(obj)
+            self.load()
+            if not hasattr(self, 'caches'):
+                self.caches = dict((addr, []) for addr in self.addrs)
+            if not hasattr(self, 'caches_inited'):
+                self.caches_inited = dict((addr, False) for addr in self.addrs)
+            if not hasattr(self, 'backup_caches'):
+                self.backup_caches = dict((addr, {}) for addr in self.addrs)
+                for addr in self.addrs:
+                    for other_addr in [n for n in self.addrs if addr != n]:
+                        self.backup_caches[addr][other_addr] = []
+                
+            self.mq_node.init()
+            self.inited = True
+        
+    def load(self):
+        save_file = os.path.join(self.dir_, MQ_STATUS_FILENAME)
+        if not os.path.exists(save_file):
+            return
+        
+        with open(save_file, 'r') as f:
+            self.caches, self.caches_inited, self.backup_caches = pickle.load(f)
+    
+    def save(self):
+        if not self.inited:
+            return
+        
+        save_file = os.path.join(self.dir_, MQ_STATUS_FILENAME)
+        with open(save_file, 'w') as f:
+            t = (self.caches, self.caches_inited, self.backup_caches)
+            pickle.dump(t, f)
+        
+    def _check_empty(self, objs):
+        if objs is None:
+            return True
+        elif isinstance(objs, list) and len(objs) == 0:
+            return True
+        return False
+            
+    def _remote_or_local_put(self, addr, objs, force=False, priority=0):
+        if self._check_empty(objs):
+            return
+        if addr == self.addr_:
+            self.mq_node.put(objs, force=force, priority=priority)
         else:
-            length = len(obj)
-            rest_length = self.NODE_FILE_SIZE - length
-            fp.write(obj + '\x00' * rest_length)
+            client_call(addr, self.prefix+'put', pickle.dumps(objs), 
+                        force, priority)
             
-        fp.flush()
-        
-    def _get_obj(self, obj, force=False):
-        if isinstance(obj, (tuple, list)):
-            if self.verify_exists_hook is None or force is True:
-                src_obj = obj
-                obj = '\n'.join(obj) + '\n'
-            else:
-                src_obj = list()
-                for itm in obj:
-                    if not self.verify_exists_hook.verify(itm):
-                        src_obj.append(itm)
-                obj = '\n'.join(src_obj) + '\n'
+    def _remote_or_local_batch_put(self, addr, objs):
+        if self._check_empty(objs):
+            return
+        if addr == self.addr_:
+            self.mq_node.batch_put(objs)
         else:
-            if self.verify_exists_hook is None or force is True:
-                src_obj = obj
-                obj = obj + '\n'
-            else:
-                if not self.verify_exists_hook.verify(obj):
-                    src_obj = obj
-                    obj = obj + '\n'
+            client_call(addr, self.prefix+'batch_put', pickle.dumps(objs))
+            
+    def _remote_or_local_get(self, addr, size=1, priority=0):
+        objs = None
+        if addr == self.addr_:
+            objs = self.mq_node.get(size=size, priority=priority)
+        else:
+            objs = pickle.loads(client_call(addr, self.prefix+'get', 
+                                            size, priority))
+        
+        addr_caches = self.caches.get(addr, [])
+        if size == 1 and objs is None and len(addr_caches) > 0:
+            return addr_caches.pop(0)
+        elif size > 1 and len(objs) == 0 and len(addr_caches) > 0:
+            return addr_caches[:size]
+        
+        return objs
+            
+    def _remote_or_local_put_backup(self, addr, backup_addr, objs, 
+                                    force=False):
+        if self._check_empty(objs):
+            return
+        if addr == self.addr_:
+            self.mq_node.put_backup(backup_addr, objs, force=force)
+        else:
+            client_call(addr, self.prefix+'put_backup', backup_addr, 
+                        pickle.dumps(objs), force)
+                    
+    def put(self, objects, flush=False):
+        """
+        Put a bunch of objects into the mq. The objects will be distributed
+        to different mq nodes according to the instance of
+        :class:`~cola.core.mq.distributor.Distributor`.
+        There also exists a cache which will not flush out unless the parameter flush
+        is true or a single destination cache is full.
+
+        :param objects: objects to put into mq, an object is mostly the instance of
+               :class:`~cola.core.unit.Url` or :class:`~cola.core.unit.Bundle`
+        :param flush: flush out the cache all if set to true
+        """
+        self.init()
+        
+        addrs_objs, backup_addrs_objs = \
+            self.distributor.distribute(objects)
+            
+        if flush is True:
+            for addr in self.addrs:
+                if addr not in addrs_objs:
+                    addrs_objs[addr] = []
+                if addr not in backup_addrs_objs:
+                    backup_addrs_objs[addr] = {}
+            
+        for addr, objs in addrs_objs.iteritems():
+            self.caches[addr].extend(objs)
+            if not self.caches_inited[addr] or \
+                len(self.caches[addr]) >= CACHE_SIZE or flush:
+                try:
+                    self._remote_or_local_batch_put(addr, self.caches[addr])
+                except socket.error, e:
+                    if self.logger:
+                        self.logger.exception(e)
                 else:
-                    return '', ''
-        
-        return src_obj, obj
-                    
-    def put(self, obj, force=False):
-        if self.stopped: return ''
-        
-        src_obj, obj = self._get_obj(obj, force=force)
+                    self.caches[addr] = []
                 
-        if len(obj.replace('\n', '')) == 0:
-            return ''
+            if not self.caches_inited[addr]:
+                self.caches_inited[addr] = True
+        
+        for addr, m in backup_addrs_objs.iteritems():
+            for backup_addr, objs in m.iteritems():
+                self.backup_caches[addr][backup_addr].extend(objs)
             
-        # If no file has enough space
-        if len(obj) > self.NODE_FILE_SIZE:
-            raise NodeNoSpaceForPut('No enouph space for this put.')
-        
-        for f in self.map_files:
-            with self.lock:
-                # check if mmap created
-                if f not in self.map_handles:
-                    fp = self.file_handles[f]
-                    self._write_obj(fp, obj)
-                    
-                    m = mmap.mmap(fp.fileno(), self.NODE_FILE_SIZE)
-                    self.map_handles[f] = m
-                else:
-                    m = self.map_handles[f]
-                    size = m.rfind('\n')
-                    new_size = size + 1 + len(obj)
-                    
-                    if new_size >= self.NODE_FILE_SIZE:
-                        continue
-                    
-                    m[:new_size] = m[:size+1] + obj
-                    m.flush()
-                
-            return src_obj
-        
-        name = str(int(os.path.split(self.map_files[-1])[1]) + 1)
-        path = os.path.join(self.dir_, name)
-        self.map_files.append(path)
-        fp = open(path, 'w+')
-        self.file_handles[path] = fp
-        self._write_obj(fp, obj)
-        self._add_handles(path)
-        
-        return src_obj
+            size = sum([len(obs) for obs in \
+                            self.backup_caches[addr].values()])
+            if size >= CACHE_SIZE or flush:
+                for backup_addr, objs in self.backup_caches[addr].iteritems():
+                    try:
+                        self._remote_or_local_put_backup(
+                            addr, backup_addr, objs)
+                    except socket.error, e:
+                        if self.logger:
+                            self.logger.exception(e)
+                    else:
+                        self.backup_caches[addr][backup_addr] = []
             
-    def get(self):
-        if self.stopped: return
+    def get(self, size=1, priority=0):
+        """
+        Get a bunch of objects from the message queue.
+        This method will try to fetch objects from local node as much as wish.
+        If not enough, will try to fetch from the other nodes.
+
+        :param size: the objects wish to fetch
+        :param priority: the priority queue which wants to fetch from
+        :return: the objects which to handle
+        """
+        self.init()
         
-        for m in self.map_handles.values():
-            with self.lock:
-                pos = m.find('\n')
-                while pos >= 0:
-                    obj = m[:pos]
-                    m[:] = m[pos+1:] + '\x00' * (pos+1)
-                    m.flush()
-                    if len(obj.strip()) != 0:
-                        return obj.strip()
-                    pos = m.find('\n')
+        if size < 1: size = 1
+        results = []
+        _addrs = sorted(self.addrs, key=lambda k: k==self.addr_, 
+                             reverse=True)
         
-    def _remove_handles(self, path):
-        if path in self.map_handles:
-            self.map_handles[path].close()
-            del self.map_handles[path]
-        if path in self.file_handles:
-            self.file_handles[path].close()
-            del self.file_handles[path]
+        for addr in _addrs:
+            left = size - len(results)
+            if left <= 0:
+                break
             
-    def _add_handles(self, path):
-        if path not in self.file_handles:
-            self.file_handles[path] = open(path, 'w+')
-        if path not in self.map_handles and \
-            os.path.getsize(path) > 0:
-            self.map_handles[path] = mmap.mmap(
-                self.file_handles[path].fileno(), self.NODE_FILE_SIZE)
-        
-    def merge(self):
-        if len(self.map_files) > 1:
-            for i in range(len(self.map_files)-1, 0, -1):
-                f_path1 = self.map_files[i-1]
-                f_path2 = self.map_files[i]
-                m1 = self.map_handles[f_path1]
-                m2 = self.map_handles[f_path2]
-                pos1 = m1.rfind('\n')
-                pos2 = m2.rfind('\n')
-                
-                if pos1 + pos2 + 2 < self.NODE_FILE_SIZE:
-                    m1[:pos1+pos2+2] = m1[:pos1+1] + m2[:pos2+1]
-                    m1.flush()
-                            
-                    self._remove_handles(f_path2)
-                    self.map_files.remove(f_path2)
-                    os.remove(f_path2)
+            objs = None
+            try:
+                objs = self._remote_or_local_get(addr, size=left, 
+                                                 priority=priority)
+            except socket.error, e:
+                if self.logger:
+                    self.logger.exception(e)
                     
-        for idx, f in enumerate(self.map_files):
-            if not f.endswith(str(idx+1)):
-                dir_ = os.path.dirname(f)
-                self._remove_handles(f)
-                self.map_files.remove(f)
+            if objs is None:
+                continue
+            if not isinstance(objs, list):
+                objs = [objs, ]
+            results.extend(objs)
+        
+        if size == 1:
+            if len(results) == 0:
+                return
+            return results[0]
+        return results
+    
+    def put_inc(self, objs):
+        self.mq_node.put_inc(objs)
+        
+    def get_inc(self, size=1):
+        return self.mq_node.get_inc(size=size)
+    
+    def flush(self):
+        self.put([], flush=True)
+    
+    def add_node(self, addr):
+        if addr in self.addrs: return
+        
+        self.init()
+        
+        self.distributor.add_node(addr)
+        self.addrs.append(addr)
                 
-                new_f = os.path.join(dir_, str(idx+1))
-                os.rename(f, new_f)
-                self.map_files.append(new_f)
-                self._add_handles(new_f)
-        self.map_files = sorted(self.map_files, key=lambda f: int(os.path.split(f)[1]))
+        self.caches[addr] = []
+        self.caches_inited[addr] = False
+        self.backup_caches[addr] = {}
+        for o_addr in self.addrs:
+            if o_addr != addr:
+                self.backup_caches[addr][o_addr] = []
+                self.backup_caches[o_addr][addr] = []
+                
+        self.mq_node.add_node(addr)
+    
+    def remove_node(self, addr):
+        if addr not in self.addrs: return
+        
+        self.init()
+        
+        self.distributor.remove_node(addr)
+        self.addrs.remove(addr)
+                
+        self.mq_node.batch_put(self.caches[addr])
+        del self.caches[addr]
+        del self.caches_inited[addr]
+        del self.backup_caches[addr]
+        for o_addr in self.addrs:
+            if o_addr != addr:
+                del self.backup_caches[o_addr][addr]
+         
+        self.flush()
+        
+        BATCH_SIZE = 10
+        objs = self.mq_node.get_backup(addr, size=BATCH_SIZE)
+        while len(objs) > 0:
+            self.mq_node.batch_put(objs)
+            objs = self.mq_node.get_backup(addr, size=BATCH_SIZE)
+        
+        self.mq_node.remove_node(addr)
+        
+    def exist(self, obj):
+        return self.mq_node.exist(obj)
+    
+    def shutdown(self):
+        if not self.inited: return
+        
+        self.mq_node.shutdown()
+        self.save()
         
     def __enter__(self):
         return self

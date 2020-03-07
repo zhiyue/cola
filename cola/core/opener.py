@@ -23,11 +23,15 @@ Created on 2013-5-17
 import urllib2
 import cookielib
 import gzip
+import socket
 
 from cola.core.errors import DependencyNotInstalledError
 
 class Opener(object):
     def open(self, url):
+        raise NotImplementedError
+
+    def read(self):
         raise NotImplementedError
     
     def ungzip(self, fileobj):
@@ -38,24 +42,60 @@ class Opener(object):
             gz.close()
 
 class BuiltinOpener(Opener):
-    def __init__(self, cookie_filename=None):
+    def __init__(self, cookie_filename=None, timeout=None, **kwargs):
         self.cj = cookielib.LWPCookieJar()
         if cookie_filename is not None:
             self.cj.load(cookie_filename)
         self.cookie_processor = urllib2.HTTPCookieProcessor(self.cj)
-        self.opener = urllib2.build_opener(self.cookie_processor, urllib2.HTTPHandler)
+        self._build_opener()
         urllib2.install_opener(self.opener)
+        
+        if timeout is None:
+            self._default_timeout = socket._GLOBAL_DEFAULT_TIMEOUT
+        else:
+            self._default_timeout = timeout
     
-    def open(self, url):
-        resp = urllib2.urlopen(url)
+    def _build_opener(self):
+        self.opener = urllib2.build_opener(self.cookie_processor, urllib2.HTTPHandler)
+    
+    def open(self, url, data=None, timeout=None):
+        if timeout is None:
+            timeout = self._default_timeout
+            
+        resp = urllib2.urlopen(url, data=data, timeout=timeout)
         is_gzip = resp.headers.dict.get('content-encoding') == 'gzip'
         if is_gzip:
             return self.ungzip(resp)
-        return resp.read()
+        self.content = resp.read()
+        return self.content
+
+    def read(self):
+        return self.content if hasattr(self, 'content') else None
+    
+    def add_proxy(self, addr, proxy_type='all',
+                  user=None, password=None):
+        if proxy_type == 'all':
+            self.proxies = {'http': addr, 'https': addr, 'ftp': addr}
+        else:
+            self.proxies[proxy_type] = addr
+        proxy_handler = urllib2.ProxyHandler(self.proxies)
+        self._build_opener()
+        self.opener.add_handler(proxy_handler)
         
+        if user and password:
+            pwd_manager = urllib2.HTTPPasswordMgrWithDefaultRealm()
+            pwd_manager.add_password(None, addr, user, password)
+            proxy_auth_handler = urllib2.ProxyBasicAuthHandler(pwd_manager)
+            self.opener.add_handler(proxy_auth_handler)
+        
+        urllib2.install_opener(self.opener)
+    
+    def remove_proxy(self):
+        self._build_opener()
+        urllib2.install_opener(self.opener)
     
 class MechanizeOpener(Opener):
-    def __init__(self, cookie_filename=None, user_agent=None, timeout=None):
+    def __init__(self, cookie_filename=None, user_agent=None, timeout=None, **kwargs):
         try:
             import mechanize
         except ImportError:
@@ -90,17 +130,46 @@ class MechanizeOpener(Opener):
         # check if gzip by
         # br.response().info().dict.get('content-encoding') == 'gzip'
         # experimently add `self.br.set_handle_gzip(True)` to handle
+        self._clear_content()
         if timeout is None:
             timeout = self._default_timout
-        return self.browser.open(url, data=data, timeout=timeout).read()
+        self.content = self.browser.open(url, data=data, timeout=timeout).read()
+        return self.content
+    
+    def add_proxy(self, addr, proxy_type='all', 
+                  user=None, password=None):
+        if proxy_type == 'all':
+            self.proxies = {'http': addr, 'https': addr, 'ftp': addr}
+        else:
+            self.proxies[proxy_type] = addr
+        self.browser.set_proxies(proxies=self.proxies)
+        if user and password:
+            self.browser.add_proxy_password(user, password)
+    
+    def remove_proxy(self):
+        self.browser.set_proxies({})
+        self.proxies = {}
     
     def browse_open(self, url, data=None, timeout=None):
         if timeout is None:
             timeout = self._default_timout
+        self._clear_content()
         self.browser.open(url, data=data, timeout=timeout)
         return self.browser
-    
+
+    def read(self):
+        if hasattr(self, 'content'):
+            return self.content
+        elif self.browser.response() is not None:
+            self.content = self.browser.response().read()
+            return self.content
+
+    def _clear_content(self):
+        if hasattr(self, 'content'):
+            del self.content
+
     def close(self):
+        self._clear_content()
         resp = self.browser.response()
         if resp is not None:
             resp.close()
@@ -146,7 +215,11 @@ class SpynnerOpener(Opener):
              wait_for_text=None, wait_for_selector=None, tries=None):
         br = self.spynner_open(url, data=data, headers=headers, method=method, 
                                wait_for_text=wait_for_text, tries=tries)
-        return br.contents
+        self.content = br.contents
+        return self.content
+
+    def read(self):
+        return self.content if hasattr(self, 'content') else self.br.contents
     
     def wait_for_selector(self, selector, **kwargs):
         self.br.wait_for_content(

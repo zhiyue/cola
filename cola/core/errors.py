@@ -20,6 +20,8 @@ Created on 2013-5-17
 @author: Chine
 '''
 
+import urllib2
+
 class DependencyNotInstalledError(Exception):
     def __init__(self, dep):
         self.dep = dep
@@ -30,3 +32,8 @@ class DependencyNotInstalledError(Exception):
 class ConfigurationError(Exception): pass
 
 class LoginFailure(Exception): pass
+
+class FetchBannedError(Exception): pass
+
+ServerError = urllib2.HTTPError
+NetworkError = urllib2.URLError
